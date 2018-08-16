@@ -1,0 +1,22 @@
+{
+  "name": "media-transcoder",
+  "version": "1.0.0",
+  "description": "Media transcoder",
+  "author": "Ben Ritz <ben.c.ritz@gmail.com>",
+  "scripts": {
+    "start": "node media-transcoder.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/benritz/docker-aws-media-transcoder"
+  },
+  "keywords": [],
+  "dependencies": {
+    "aws-sdk": "^2.294.0"
+  },
+  "devDependencies": {},
+  "preferGlobal": false,
+  "private": false,
+  "analyze": true,
+  "license": "NONE"
+}
