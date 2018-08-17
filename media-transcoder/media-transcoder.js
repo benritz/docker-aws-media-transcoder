@@ -2,6 +2,7 @@ const https = require('https');
 const path = require('path');
 const url = require('url');
 const fs = require('fs');
+const { spawn } = require('child_process');
 const AWS = require('aws-sdk/global');
 const DynamoDB = require('aws-sdk/clients/dynamodb');
 const SQS = require('aws-sdk/clients/sqs');
@@ -28,71 +29,69 @@ var s3 = new AWS.S3 ({
     httpOptions: httpOptions
 });
 
+const exec = async (command, args) => {
+    return new Promise((resolve, reject) => {
+		const process = spawn(command, args);
+
+		let out = '';
+
+		process.on('exit', (code, signal) => {
+			if (code === 0)
+				resolve(out)
+			else
+				reject();
+		});
+
+		process.stdout.on('data', (data) => { out += data; });
+    });
+}
+
 const downloadFile = async (bucket, key, os) => {
     return new Promise((resolve, reject) => {
-    	console.log(1);
-        const is = s3.getObject({ Bucket: bucket, Key: key }).createReadStream();
+    	const req = s3.getObject({ Bucket: bucket, Key: key });
 
-		console.log(is);
-		console.log(2);
+		let headers = null;
+		req.on('httpHeaders', (err, data) => {
+			headers = data;
+		});
+
+        const is = req.createReadStream();
 
         is.on('error', (err) => {
-        	console.log("is error");
-        	console.log(err);
             os.destroy();
             reject(err);
         });
 
-		console.log(3);
-        
         os.on('error', (err) => {
-        	console.log("os error");
-        	console.log(err);
             is.destroy();
             reject(err);
         });
 
-		console.log(4);
-        
-        os.on('close', resolve);
+        os.on('close', () => { resolve(headers) } );
 
-		console.log(5);
-        
         is.pipe(os);
-
-		console.log(6);
     });
 }
 
-const processFile = async (itemID, fileName) => {
-	// parse s3 file name
+const parseS3Filename = (fileName) => {
 	const parsed = new url.URL(fileName);
-	const bucket = parsed.host;
-	const key = parsed.pathname.substring(1);
 
-	const basename = path.basename(key);
-	
-	console.log(bucket);
-	console.log(key);
-	console.log(basename);
+	return { bucket: parsed.host, key: parsed.pathname.substring(1) };
+}
+
+const processFile = async (itemID, fileName) => {
+	const s3Obj = parseS3Filename(fileName);
+	const basename = path.basename(s3Obj.key);
 
 	// download file
 	const local = '/tmp/' + basename;
 
-	console.log(local);
-
 	try {
-		const os = fs.createWriteStream(local);
+		await downloadFile(s3Obj.bucket, s3Obj.key, fs.createWriteStream(local));
+		const tags = await exec('exiftool', [local, '-json', '-g1', '-s']);
 	
-		console.log(os);
-	
-		await downloadFile(bucket, key, os);
+		console.log(tags);
 		
-		console.log("downloaded");
-	
-		const stats = fs.statSync(local);
-	
-		console.log(stats);
 	} catch (e) {
 		console.error(e);
 	}
