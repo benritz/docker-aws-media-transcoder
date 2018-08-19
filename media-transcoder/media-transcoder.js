@@ -7,27 +7,64 @@ const AWS = require('aws-sdk/global');
 const DynamoDB = require('aws-sdk/clients/dynamodb');
 const SQS = require('aws-sdk/clients/sqs');
 const S3 = require('aws-sdk/clients/s3');
+const CloudWatch = require('aws-sdk/clients/cloudwatch');
 
-const httpOptions = {
-    agent: new https.Agent({
-        rejectUnauthorized: false,
-        keepAlive: true
-    })};
+// setup AWS services
+https.globalAgent.options.keepAlive = true;
 
-const db = new DynamoDB({
-    apiVersion: '2012-08-10',
-    httpOptions: httpOptions
-});
+const db = new DynamoDB({ apiVersion: '2012-08-10' });
+var sqs = new SQS({ apiVersion: '2012-11-05' });
+var s3 = new S3 ({ apiVersion: '2006-03-01' });
+var cloudwatch = new CloudWatch({ apiVersion: '2010-08-01' });
 
-var sqs = new SQS({
-    apiVersion: '2012-11-05',
-    httpOptions: httpOptions
-});
+// inputs
+const queueURL = process.env.QUEUE_URL
+if (!queueURL)
+	throw "MissingQueueURL"
 
-var s3 = new AWS.S3 ({
-    apiVersion: '2006-03-01',
-    httpOptions: httpOptions
-});
+const maxIdleSeconds = process.env.MAX_IDLE_SECONDS || 60;		// default 1 minute 
+
+
+const getVisibleMesssages = async () => {
+	const endTime = new Date(), startTime = new Date(endTime.getTime() - (60 * 60 * 1000));
+
+	const params = {
+		MetricDataQueries: [{
+			Id: 'mediaTranscoderVisibleMessages',
+			MetricStat: {
+				Metric: {
+					Dimensions: [{
+						Name: 'QueueName',
+						Value: 'MediaTranscoder'
+					}, ],
+					MetricName: 'ApproximateNumberOfMessagesVisible',
+					Namespace: 'AWS/SQS'
+				},
+				Period: 300,
+				Stat: 'Average',
+				Unit: 'Count'
+			},
+			ReturnData: true
+		}, ],
+		StartTime: startTime.toISOString(),
+		EndTime: endTime.toISOString(),
+		ScanBy: 'TimestampAscending'
+	};
+
+	cloudwatch.getMetricData(params)
+		.promise()
+		.then((data) => {
+			const result = data.MetricDataResults.find((result) => result.Id === "mediaTranscoderVisibleMessages");
+			if (result) {
+				console.log(result);
+				console.log(result.Values);
+				console.log(result.Timestamps);
+			}
+		})
+		.catch((e) => {
+			console.error("GetVisibleMessagesFailed", e);
+		});
+}
 
 const exec = async (command, args) => {
     return new Promise((resolve, reject) => {
@@ -156,6 +193,7 @@ const parseS3Filename = (fileName) => {
 }
 
 const processFile = async (itemID, fileName) => {
+	console.time("processFile");
 	console.log('Processing: ', itemID, fileName);
 
 	const s3Obj = parseS3Filename(fileName);
@@ -175,6 +213,8 @@ const processFile = async (itemID, fileName) => {
 	try {
 		const keyTags = ".media/" + itemID + "/tags.txt";
 		await execToS3('exiftool', [local, '-json', '-g1', '-s'], s3Obj.bucket, keyTags);
+		
+		console.log("Tags extracted");
 	} catch (e) {
 		console.error('GetTagsFailed', e);
 	}
@@ -182,14 +222,17 @@ const processFile = async (itemID, fileName) => {
 	try {
 		const keyThumb = ".media/" + itemID + "/thumb.png";
 		await execToS3('convert', ['-quiet', '(', '-auto-orient', '-resize', '250x250', local, ')', '-strip', 'png:-'], s3Obj.bucket, keyThumb);
+
+		console.log("Thumb generated");
 	} catch (e) {
 		console.error('CreateThumbFailed', e);
 	}
 
-	console.log('Processed: ', itemID, fileName);
+	console.timeEnd("processFile");
 }
 
 const processQueue = async () => {
+	/*
 	// get queue URL
 	const queueName = 'MediaTranscoder';
 
@@ -205,48 +248,79 @@ const processQueue = async () => {
 		console.error("GetQueueURLFailed", queueName);
 		return null;
 	}
+	*/
+	
+	const visibilityTimeoutSeconds = 20, 
+			visibilityTimeoutThreshold = 5, 
+			waitTimeSeconds = Math.min(20, maxIdleSeconds);
 
-	// process messages until none found
+	let lastProcessedTime = new Date().getTime();
+
 	while (true) {
-		const msg = await sqs.receiveMessage({
+		const msgs = await sqs.receiveMessage({
 			AttributeNames: ["SentTimestamp"],
-			MaxNumberOfMessages: 1,
+			MaxNumberOfMessages: 10,
 			QueueUrl: queueURL,
-			VisibilityTimeout: 20,
-			WaitTimeSeconds: 0
+			VisibilityTimeout: visibilityTimeoutSeconds,
+			WaitTimeSeconds: waitTimeSeconds
 			})
 			.promise()
 			.then((data) => {
-				if (data.Messages) {
-					return data.Messages[0];
-				}
-
-				return null;
+				return data.Messages;
 			})
 			.catch((err) => {
 				console.error(err);
-
-				return null;
+				return [];
 			});
 
-		if (msg === null) {
-			console.log("No more messages");
-			break;
-		}
-	
-		const body = JSON.parse(msg.Body);
-		
-		await processFile(body.itemID, body.fileName);
+		const startTime = new Date().getTime();
 
-		sqs.deleteMessage({ QueueUrl: queueURL, ReceiptHandle: msg.ReceiptHandle })
-			.promise()
-			.then((data) => {
-				console.log('');
-			})
-			.catch((e) => {
-				console.error('DeleteMsgFailed', e);
-			});	
+		if (msgs) {
+			// process messages in series using Array.reduce, the previous message's 
+			// async result is passed as the accumulator and the final message's async 
+			// result is returned
+			await msgs.reduce(async (prevAsync, msg) => {
+				// wait for previous async result
+				await prevAsync;
+
+				// abandon processing message if outside of the visibility timeout
+				const runningTime = Math.ceil((new Date().getTime() - startTime) / 1000);
+				
+				if (runningTime > visibilityTimeoutSeconds - visibilityTimeoutThreshold) {
+					console.log("Visibility timeout, ignoring message", msg.MessageId);
+					return;
+				}
+
+				// process + delete msg
+				const body = JSON.parse(msg.Body);
+
+				await processFile(body.itemID, body.fileName);
+
+				await sqs.deleteMessage({ QueueUrl: queueURL, ReceiptHandle: msg.ReceiptHandle })
+					.promise()
+					.catch((e) => {
+						console.error('DeleteMsgFailed', e);
+					});
+			}, Promise.resolve());
+
+			lastProcessedTime = new Date().getTime();
+		} else {
+			const idleSeconds = Math.floor((startTime - lastProcessedTime) / 1000);
+
+			console.log("No messages", "Idle seconds=", idleSeconds);
+
+			if (idleSeconds >= maxIdleSeconds) {
+				console.log("Exceeded maximum idle seconds");
+				break;
+			}
+		}
 	}
 }
 
-processQueue().then(() => { console.log("Task complete"); });
+processQueue()
+	.then(() => {
+		console.log("Task complete");
+	})
+	.catch((e) => {
+		console.error('TaskFailed', e);
+	});
